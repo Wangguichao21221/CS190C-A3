@@ -51,3 +51,7 @@ wandb/
 # Optional local data/cache folders
 cache/
 .cache/
+
+# lora weights
+
+*.bin

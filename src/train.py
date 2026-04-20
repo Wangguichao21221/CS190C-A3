@@ -1,35 +1,63 @@
 import argparse
 import os
 
-# Set endpoint before importing Hugging Face related libraries.
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-os.environ.setdefault("HUGGINGFACE_HUB_ENDPOINT", "https://hf-mirror.com")
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, Trainer, TrainingArguments
+from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 from utils import set_hf_endpoint, count_trainable_parameters
 from data import gsm8k_dataset
 from lora import LoRAConfig, inject_lora, lora_state_dict, mark_only_lora_trainable
 
 
-def _format_sample(question: str, answer: str) -> str:
+def _format_prompt(question: str) -> str:
   return (
       "You are a helpful math tutor. Solve the problem step by step and end with '#### <answer>'.\n\n"
       f"Question: {question}\n"
-      f"Answer: {answer}"
+      "Answer: "
   )
 
 
+def _format_sample(question: str, answer: str, eos_token: str) -> str:
+  return f"{_format_prompt(question)}{answer}{eos_token}"
+
+
 def _tokenize_function(examples, tokenizer, max_length: int):
-  texts = [_format_sample(q, a) for q, a in zip(examples["question"], examples["answer"])]
+  eos_token = tokenizer.eos_token or ""
+  prompt_texts = [_format_prompt(q) for q in examples["question"]]
+  texts = [_format_sample(q, a, eos_token) for q, a in zip(examples["question"], examples["answer"])]
+  prompt_outputs = tokenizer(
+      prompt_texts,
+      truncation=True,
+      max_length=max_length,
+      padding=False,
+  )
   outputs = tokenizer(
       texts,
       truncation=True,
       max_length=max_length,
       padding=False,
   )
-  outputs["labels"] = outputs["input_ids"].copy()
+
+  labels = []
+  for prompt_ids, input_ids in zip(prompt_outputs["input_ids"], outputs["input_ids"]):
+    prompt_length = min(len(prompt_ids), len(input_ids))
+    label = [-100] * prompt_length + input_ids[prompt_length:]
+    labels.append(label)
+
+  outputs["labels"] = labels
   return outputs
+
+
+class DataCollatorForCompletionOnlyLM:
+  def __init__(self, tokenizer):
+    self.tokenizer = tokenizer
+
+  def __call__(self, features):
+    labels = [torch.tensor(feature.pop("labels"), dtype=torch.long) for feature in features]
+    batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
+    batch["labels"] = pad_sequence(labels, batch_first=True, padding_value=-100)
+    return batch
 
 
 def parse_args():
@@ -43,7 +71,12 @@ def parse_args():
   parser.add_argument("--grad_accum", type=int, default=16)
   parser.add_argument("--max_train_samples", type=int, default=None)
   parser.add_argument("--max_steps", type=int, default=-1)
+  parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+  parser.add_argument("--save_checkpoints", action="store_true")
   parser.add_argument("--smoke_test", action="store_true")
+  parser.add_argument("--lora_r", type=int, default=8)
+  parser.add_argument("--lora_alpha", type=int, default=16)
+  parser.add_argument("--lora_dropout", type=float, default=0.05)
   return parser.parse_args()
 
 
@@ -63,6 +96,9 @@ def main():
     dataset = dataset.select(range(min(args_cli.max_train_samples, len(dataset))))
     print(f"Using {len(dataset)} training samples")
 
+  tensorboard_log_dir = os.path.join('./logs', "qwen2.5-7b-gsm8k-lora")
+  os.environ["TENSORBOARD_LOGGING_DIR"] = tensorboard_log_dir
+
   tokenizer = AutoTokenizer.from_pretrained(
       model_name,
       use_fast=False
@@ -71,16 +107,16 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
   model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
   )
 
   model.config.use_cache = False # 训练时建议关掉
   model.gradient_checkpointing_enable()
 
   lora_config = LoRAConfig(
-      r=8,
-      alpha=16,
-      dropout=0.05,
+      r=args_cli.lora_r,
+      alpha=args_cli.lora_alpha,
+      dropout=args_cli.lora_dropout,
   )
   replaced = inject_lora(model, lora_config)
   mark_only_lora_trainable(model)
@@ -103,12 +139,13 @@ def main():
       per_device_train_batch_size=args_cli.batch_size,
       gradient_accumulation_steps=args_cli.grad_accum,
       logging_steps=10,
+      save_strategy="steps" if args_cli.save_checkpoints else "no",
       save_steps=200,
-      save_total_limit=2,
+      save_total_limit=1 if args_cli.save_checkpoints else None,
       max_steps=args_cli.max_steps,
       fp16=torch.cuda.is_available(),
       bf16=False,
-      report_to="none",
+      report_to="tensorboard",
       remove_unused_columns=False,
   )
 
@@ -116,11 +153,10 @@ def main():
       model=model,
       args=args,
       train_dataset=tokenized_train,
-      data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+      data_collator=DataCollatorForCompletionOnlyLM(tokenizer),
   )
-  trainer.train()
+  trainer.train(resume_from_checkpoint=args_cli.resume_from_checkpoint)
 
-  trainer.save_model(args.output_dir)
   tokenizer.save_pretrained(args.output_dir)
   torch.save(lora_state_dict(model), f"{args.output_dir}/lora_only.bin")
 
